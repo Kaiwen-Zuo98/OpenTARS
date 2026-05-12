@@ -6,8 +6,8 @@
   },
   "dependencies": {
     "@vitejs/plugin-vue": "latest",
+    "pcm-player": "^0.0.18",
     "vite": "latest",
     "vue": "latest"
-  },
-  "devDependencies": {}
+  }
 }

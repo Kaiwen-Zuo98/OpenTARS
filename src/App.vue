@@ -1,25 +1,45 @@
 <script setup>
-import { ref } from 'vue';
+let nextPlayTime = 0; // 记录下一个音频块应该在什么时间播放
+let audioSources = []; // 收集当前正在播放的音频节点，用于精准打断
+let pingInterval = null;
+// 在之前的 nextPlayTime 附近新增这个变量
+let leftoverByte = null;
+import { ref, onMounted, onUnmounted } from 'vue';
+import PCMPlayer from 'pcm-player'; // 引入开源库
 
-// --- Reactive State ---
+// ... 原本的其他变量 ...
+let pcmPlayer = null; // 替换原本的 playAudioContext 等变量
 
-// 1. Avatar URL
-import defaultAvatar from './assets/my-avatar.png';
+// --- 引入本地默认头像 (请确保路径正确，否则会报错) ---
+// 如果没有该本地文件，请替换为一个网络图片 URL 字符串
+import defaultAvatar from './assets/my-avatar.png'; 
+
+// === 1. 响应式状态 (UI 绑定) ===
 const avatarUrl = ref(defaultAvatar);
-// 2. Transcipt Area content
 const transcript = ref('字幕会显示在这里…');
-
-// 3. Affection Level (0-100)
+// 将原来的硬编码文案提取为响应式变量，方便后续 WebSocket 更新
+const currentMessage = ref('终于等到你啦～今天有没有想我？我刚刚还在想，等你上线后第一句话要说什么才会让你开心一点。');
 const affectionLevel = ref(60);
 
-// 4. Recording State for animation and simulation
 const isRecording = ref(false);
-
-// Ref for hidden file input
+const isSpeaking = ref(false); // 用于记录 AI 是否正在说话
 const fileInputRef = ref(null);
 
-// --- Methods ---
+// === 2. WebSocket 与音频底层变量 ===
+// TODO: 替换为你真实的服务器地址
+const WS_URL = 'ws://172.16.29.39:18888/ws'; 
+let ws = null;
 
+// 录音相关 (麦克风)
+let recordAudioContext = null;
+let mediaStream = null;
+let scriptProcessor = null;
+
+// 播放相关 (AI 声音)
+let playAudioContext = null;
+let currentPlaySource = null;
+
+// === 3. UI 交互方法 ===
 const handleUploadClick = () => {
   if (fileInputRef.value) {
     fileInputRef.value.click();
@@ -37,31 +57,239 @@ const handleFileChange = (e) => {
   }
 };
 
-const toggleRecording = () => {
-  isRecording.value = !isRecording.value;
-  
-  if (isRecording.value) {
-    transcript.value = '正在聆听您的心声...';
-  } else {
-    simulateTranscription();
-  }
-};
-
 const handleQuickReply = (text) => {
   transcript.value = `用户：${text}`;
   isRecording.value = false;
+  // 此处可扩展为通过 WS 发送文本给服务端（如果协议支持）
 };
 
-const simulateTranscription = () => {
-  setTimeout(() => {
-    const dummyInputs = [
-      '今天在外面看到一朵很像你的云☁️',
-      '工作有点累了，求安慰😔',
-      '你今天过得开心吗？'
-    ];
-    transcript.value = `用户：${dummyInputs[Math.floor(Math.random() * dummyInputs.length)]}`;
-  }, 1000);
+// === 4. WebSocket 初始化与事件处理 ===
+const initWebSocket = () => {
+  ws = new WebSocket(WS_URL);
+  
+  ws.onopen = () => {
+    console.log('✅ WebSocket 已连接');
+    
+    // 💡 新增：开启心跳保活，每 8 秒向服务端发送一次 ping
+    pingInterval = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        // 根据标准的 JSON 交互格式，发送一个心跳事件
+        ws.send(JSON.stringify({ 
+          event: 'client.ping', // 事件名可以根据你后端的实际情况调整
+          data: {} 
+        }));
+        console.log('💓 发送保活心跳');
+      }
+    }, 8000); // 8秒 < 10秒超时限制
+  };
+
+  ws.onerror = (e) => console.error('❌ WebSocket 错误', e);
+  
+  ws.onclose = () => {
+    console.log('⚠️ WebSocket 已断开，尝试重连...');
+    
+    // 💡 新增：断开连接时，务必清理定时器，防止内存泄漏
+    if (pingInterval) {
+      clearInterval(pingInterval);
+      pingInterval = null;
+    }
+    
+    // 3秒后尝试重连
+    setTimeout(initWebSocket, 3000);
+  };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    
+    // 💡 新增：如果服务端回复了 pong，可以选择忽略或打印
+    if (msg.event === 'server.pong') {
+      console.log('💚 收到服务端 pong');
+      return; 
+    }
+
+    switch(msg.event) {
+      case 'server.input.transcript': 
+        transcript.value = msg.data.text;
+        break;
+      case 'server.response.transcript': 
+        currentMessage.value = msg.data.text;
+        break;
+      case 'server.response.audio': 
+        isSpeaking.value = true;
+        // 【修改点】：不再依赖服务端的 sample_rate 字段，强制传入 16000
+        playBase64PCM(msg.data.data, 16000);
+        break;
+      case 'server.tts.sentence.end': 
+        isSpeaking.value = false;
+        break;
+      case 'server.response.audio.interrupt': 
+        stopAudioPlayback();
+        isSpeaking.value = false;
+        break;
+    }
+  };
 };
+
+// === 5. 音频采集与发送 (麦克风 -> PCM -> Base64 -> WS) ===
+
+const startRecording = async () => {
+  try {
+    // 【修复 1】：趁着用户点击了录音按钮，立刻唤醒并激活播放器！绕过浏览器的静音限制
+    if (!playAudioContext) {
+      playAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (playAudioContext.state === 'suspended') {
+      await playAudioContext.resume();
+    }
+    nextPlayTime = playAudioContext.currentTime; // 同步当前时间
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: 'client.input_audio_buffer.clear', data: {} }));
+    }
+    stopAudioPlayback(); 
+
+    mediaStream = await navigator.mediaDevices.getUserMedia({ 
+      audio: {
+        echoCancellation: true,  
+        noiseSuppression: true,  
+        autoGainControl: true,   
+        sampleRate: 16000,       
+        channelCount: 1          
+      } 
+    });
+
+    recordAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    const source = recordAudioContext.createMediaStreamSource(mediaStream);
+    scriptProcessor = recordAudioContext.createScriptProcessor(4096, 1, 1);
+    
+    scriptProcessor.onaudioprocess = (e) => {
+      if (!isRecording.value) return;
+      
+      const float32Array = e.inputBuffer.getChannelData(0);
+      const int16Array = new Int16Array(float32Array.length);
+      
+      for (let i = 0; i < float32Array.length; i++) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]));
+        int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      
+      const buffer = new Uint8Array(int16Array.buffer);
+      let binary = '';
+      for (let i = 0; i < buffer.byteLength; i++) {
+        binary += String.fromCharCode(buffer[i]);
+      }
+      const base64 = window.btoa(binary);
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          event: 'client.input.audio.append',
+          data: { format: 'pcm', sample_rate: 16000, data: base64 }
+        }));
+      }
+    };
+
+    source.connect(scriptProcessor);
+    scriptProcessor.connect(recordAudioContext.destination);
+    
+    isRecording.value = true;
+    transcript.value = "正在聆听...";
+  } catch (err) {
+    console.error("麦克风权限获取或设置失败:", err);
+    transcript.value = "请允许麦克风权限";
+  }
+};
+
+const stopRecording = () => {
+  isRecording.value = false;
+  if (scriptProcessor) scriptProcessor.disconnect();
+  if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+  if (recordAudioContext) recordAudioContext.close();
+  transcript.value = "录音已结束"; // 临时显示，等服务端推送 server.input.transcript 覆盖
+};
+
+const toggleRecording = () => {
+  if (isRecording.value) stopRecording();
+  else startRecording();
+};
+
+const sendMessage = () => {
+  // 可以在这里拓展手动发送逻辑
+  if (isRecording.value) stopRecording();
+};
+
+// === 6. 音频播放解码 (Base64 -> PCM -> AudioContext) ===
+// === 6. 音频播放解码 (使用开源库 pcm-player) ===
+
+const playBase64PCM = (base64Data) => {
+  // 1. 初始化或恢复播放器
+  if (!pcmPlayer) {
+    pcmPlayer = new PCMPlayer({
+      inputCodec: 'Int16',   // 声明服务端传来的是 16位 PCM
+      channels: 1,           // 单声道
+      sampleRate: 24000,     // 目标采样率 24000Hz
+      flushTime: 100         // 【内置防抖缓冲】：每 100ms 作为一个播放块，彻底解决卡顿和撕裂音
+    });
+    console.log("🔊 PCM Player 初始化完成！");
+  }
+
+  // 2. Base64 字符串解码与跨包错位处理（这点开源库不管，需要业务保留）
+  const binary = window.atob(base64Data);
+  let bytesArray = [];
+  if (leftoverByte !== null) {
+    bytesArray.push(leftoverByte);
+    leftoverByte = null;
+  }
+  for (let i = 0; i < binary.length; i++) {
+    bytesArray.push(binary.charCodeAt(i));
+  }
+  
+  if (bytesArray.length % 2 !== 0) {
+    leftoverByte = bytesArray.pop(); // 抠出奇数字节给下一个包
+  }
+  
+  if (bytesArray.length === 0) return;
+
+  const bytes = new Uint8Array(bytesArray);
+
+  // 3. 喂给开源库！(它内部会自动转 Float32 并严格按时间轴排队播放)
+  pcmPlayer.feed(bytes);
+
+  // 4. 模拟播放完成反馈 (pcm-player 是合并流，不提供单个分片的 onended 事件)
+  // 我们通过公式计算出这个分片的准确播放时长，用 setTimeout 来发送 played 回调
+  // 公式: 时长(毫秒) = (字节数 / 2 (16位占2字节) / 24000 (采样率)) * 1000
+  const durationMs = (bytes.length / 2 / 24000) * 1000;
+  
+  setTimeout(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        event: 'client.response.audio.feedback',
+        data: { event: 'played' }
+      }));
+    }
+  }, durationMs);
+};
+
+// 完善打断机制
+const stopAudioPlayback = () => {
+  if (pcmPlayer) {
+    pcmPlayer.destroy(); // 直接销毁实例，清空所有排队的音频
+    pcmPlayer = null;
+  }
+  leftoverByte = null; // 清空残留字节
+};
+
+
+// === 7. 生命周期挂载 ===
+onMounted(() => {
+  initWebSocket();
+});
+
+onUnmounted(() => {
+  if (pingInterval) clearInterval(pingInterval);
+  if (ws) ws.close();
+  stopRecording();
+  stopAudioPlayback();
+});
 </script>
 
 <template>
@@ -86,7 +314,7 @@ const simulateTranscription = () => {
         
         <div class="avatar-section">
           <div class="avatar-view">
-            <img :src="avatarUrl" alt="AI Companion" class="main-avatar" />
+            <img :src="avatarUrl" alt="AI Companion" class="main-avatar" :class="{'speaking': isSpeaking}" />
             <input type="file" accept="image/*" ref="fileInputRef" class="hidden-input" @change="handleFileChange" />
             <button class="change-avatar-btn glass" @click="handleUploadClick">
               &#8634; 更换形象
@@ -94,7 +322,7 @@ const simulateTranscription = () => {
           </div>
 
           <div class="ai-chat-bubble glass">
-            <p>终于等到你啦～今天有没有想我？我刚刚还在想，等你上线后第一句话要说什么才会让你开心一点。</p>
+            <p>{{ currentMessage }}</p>
           </div>
         </div>
 
@@ -111,7 +339,9 @@ const simulateTranscription = () => {
           <button class="action-btn glass" @click="handleQuickReply('夸夸我')">✨ 夸夸我</button>
         </section>
 
-      </main> <footer class="bottom-input-area">
+      </main> 
+
+      <footer class="bottom-input-area">
         <div class="input-controls glass">
           <button class="icon-btn keyboard-btn">&#9000;</button>
           
@@ -133,7 +363,7 @@ const simulateTranscription = () => {
             </template>
           </button>
 
-          <button class="icon-btn send-btn">&#10095;</button>
+          <button class="icon-btn send-btn" @click="sendMessage">&#10095;</button>
         </div>
         <div class="footer-note">AI 生成</div>
       </footer>
@@ -143,6 +373,8 @@ const simulateTranscription = () => {
 </template>
 
 <style scoped>
+/* =========== 保留你原本的所有绝美 CSS =========== */
+
 /* 基础设置 */
 .hidden-input { display: none; }
 
@@ -190,7 +422,6 @@ const simulateTranscription = () => {
 
 /* 1. 顶部栏 */
 .top-bar {
-  /* 防止被压缩 */
   flex-shrink: 0; 
   display: flex;
   justify-content: space-between;
@@ -221,15 +452,13 @@ const simulateTranscription = () => {
   border: 3px solid rgba(255,255,255,0.9); box-shadow: 0 5px 15px rgba(0,0,0,0.1);
 }
 
-/* 2. 中间主要内容区 (关键) */
+/* 2. 中间主要内容区 */
 .main-content-area {
-  /* 撑满剩余空间，内容过多时可以滚动，保证不挤压顶部和底部 */
   flex: 1; 
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   align-items: center;
-  /* 隐藏滚动条但保留功能 */
   scrollbar-width: none; 
 }
 .main-content-area::-webkit-scrollbar { display: none; }
@@ -244,6 +473,11 @@ const simulateTranscription = () => {
   width: 100%; height: 100%; object-fit: contain;
   mask-image: linear-gradient(to bottom, black 85%, transparent 100%);
   -webkit-mask-image: linear-gradient(to bottom, black 85%, transparent 100%);
+  transition: transform 0.3s ease;
+}
+.main-avatar.speaking {
+  /* 当 AI 说话时，稍微放大，增加呼吸/互动感 */
+  transform: scale(1.02);
 }
 .change-avatar-btn {
   position: absolute; top: 10px; right: -20px; padding: 8px 16px;
@@ -265,7 +499,7 @@ const simulateTranscription = () => {
 
 .quick-actions {
   display: flex; justify-content: center; gap: 12px; margin-top: 20px;
-  padding: 0 30px; flex-wrap: wrap; margin-bottom: 20px; /* 留点底部边距 */
+  padding: 0 30px; flex-wrap: wrap; margin-bottom: 20px; 
 }
 .action-btn {
   padding: 10px 20px; border-radius: 25px; font-size: 14px; color: #666;
@@ -273,16 +507,14 @@ const simulateTranscription = () => {
 }
 .action-btn:hover { background: rgba(255,255,255,0.95); transform: translateY(-2px); }
 
-/* 3. 底部输入区 (关键) */
+/* 3. 底部输入区 */
 .bottom-input-area {
-  /* 防止被压缩，固定在容器最底端 */
   flex-shrink: 0; 
   width: 100%;
-  padding: 20px 30px 25px 30px; /* 调整内边距 */
+  padding: 20px 30px 25px 30px; 
   display: flex;
   flex-direction: column;
   align-items: center;
-  /* 加一个微弱的渐变背景，如果内容滚动可以起到遮罩效果 */
   background: linear-gradient(to bottom, transparent, rgba(255,255,255,0.4) 30%);
 }
 
