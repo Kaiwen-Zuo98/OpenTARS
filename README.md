@@ -24,16 +24,29 @@ OpenTARS 是一个沉浸式 AI 恋爱数字人的 Web 前端终端。本项目�
 
 ---
 
-## 📂 项目结构 (Structure)
+## 🚀 快速启动指南 (Getting Started)
 
-```text
-my-vue-chat/
-├── public/                 # 静态资源 (Favicon等)
-├── src/
-│   ├── assets/             # 图片、全局 CSS (包含玻璃拟态样式)
-│   │   └── my-avatar.png   # 默认数字人头像
-│   ├── App.vue             # 核心应用逻辑 (WebSocket, PCM流处理, UI绑定)
-│   └── main.js             # Vue 实例入口
-├── index.html              # HTML 骨架
-├── package.json            # 依赖配置 (包含 pcm-player, vue)
-└── vite.config.js          # Vite 构建配置
+### 🛠️ 1. 环境准备 (Prerequisites)
+
+为了顺利运行本项目，你的本地开发环境需要满足以下基本要求：
+
+* **Node.js**: 建议版本 **v16.0.0** 或更高（推荐使用最新的 LTS 版本）。
+* **包管理器**: npm (随 Node.js 一起安装) 或 yarn/pnpm。
+* **Git**: 用于克隆代码仓库。
+* **现代浏览器**: Chrome、Edge 或 Safari (由于涉及到深度的 Web Audio API 和麦克风权限调用，请务必使用最新版浏览器)。
+
+### 📦 2. 获取代码与安装依赖
+
+首先，将前端代码克隆到你的本地电脑中，并进入项目目录进行依赖安装：
+
+```bash
+# 克隆项目库
+git clone https://github.com/Kaiwen-Zuo98/OpenTARS.git
+
+# 进入项目目录
+cd OpenTARS
+
+# 安装依赖
+npm install
+
+
