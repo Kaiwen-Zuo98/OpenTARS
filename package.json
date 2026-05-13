@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "pcm-player": "^0.0.18",
     "vue": "^3.4.21"
   },
   "devDependencies": {
