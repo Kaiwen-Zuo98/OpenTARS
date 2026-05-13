@@ -233,6 +233,7 @@ const playBase64PCM = (base64Data, sample_rate) => {
       sampleRate: sample_rate,     // 目标采样率 24000Hz
       flushTime: 100         // 【内置防抖缓冲】：每 100ms 作为一个播放块，彻底解决卡顿和撕裂音
     });
+    pcmPlayer.volume(6.0); 
     console.log("🔊 PCM Player 初始化完成！");
   }
 
