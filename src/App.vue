@@ -7,6 +7,8 @@ let leftoverByte = null;
 import { ref, onMounted, onUnmounted } from 'vue';
 import PCMPlayer from 'pcm-player'; // 引入开源库
 
+const sampleRate = 24000;
+
 // ... 原本的其他变量 ...
 let pcmPlayer = null; // 替换原本的 playAudioContext 等变量
 
@@ -107,6 +109,8 @@ const initWebSocket = () => {
       return; 
     }
 
+    // console.log(msg.event, msg.data.length);
+
     switch(msg.event) {
       case 'server.input.transcript': 
         transcript.value = msg.data.text;
@@ -117,7 +121,7 @@ const initWebSocket = () => {
       case 'server.response.audio': 
         isSpeaking.value = true;
         // 【修改点】：不再依赖服务端的 sample_rate 字段，强制传入 16000
-        playBase64PCM(msg.data.data, 16000);
+        playBase64PCM(msg.data.data, msg.data.sample_rate);
         break;
       case 'server.tts.sentence.end': 
         isSpeaking.value = false;
@@ -153,7 +157,7 @@ const startRecording = async () => {
         echoCancellation: true,  
         noiseSuppression: true,  
         autoGainControl: true,   
-        sampleRate: 16000,       
+        sampleRate: sampleRate,       
         channelCount: 1          
       } 
     });
@@ -183,7 +187,7 @@ const startRecording = async () => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           event: 'client.input.audio.append',
-          data: { format: 'pcm', sample_rate: 16000, data: base64 }
+          data: { format: 'pcm', sample_rate: sampleRate, data: base64 }
         }));
       }
     };
@@ -220,13 +224,13 @@ const sendMessage = () => {
 // === 6. 音频播放解码 (Base64 -> PCM -> AudioContext) ===
 // === 6. 音频播放解码 (使用开源库 pcm-player) ===
 
-const playBase64PCM = (base64Data) => {
+const playBase64PCM = (base64Data, sample_rate) => {
   // 1. 初始化或恢复播放器
   if (!pcmPlayer) {
     pcmPlayer = new PCMPlayer({
       inputCodec: 'Int16',   // 声明服务端传来的是 16位 PCM
       channels: 1,           // 单声道
-      sampleRate: 24000,     // 目标采样率 24000Hz
+      sampleRate: sample_rate,     // 目标采样率 24000Hz
       flushTime: 100         // 【内置防抖缓冲】：每 100ms 作为一个播放块，彻底解决卡顿和撕裂音
     });
     console.log("🔊 PCM Player 初始化完成！");
@@ -257,7 +261,7 @@ const playBase64PCM = (base64Data) => {
   // 4. 模拟播放完成反馈 (pcm-player 是合并流，不提供单个分片的 onended 事件)
   // 我们通过公式计算出这个分片的准确播放时长，用 setTimeout 来发送 played 回调
   // 公式: 时长(毫秒) = (字节数 / 2 (16位占2字节) / 24000 (采样率)) * 1000
-  const durationMs = (bytes.length / 2 / 24000) * 1000;
+  const durationMs = (bytes.length / 2 / sample_rate) * 1000;
   
   setTimeout(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
